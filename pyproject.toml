@@ -1,0 +1,24 @@
+[project]
+name = "bq-ch-migrator"
+version = "0.1.0"
+description = "Migrate BigQuery tables to ClickHouse via GCS or S3"
+readme = "README.md"
+authors = [
+    { name = "Joe Lynch", email = "joe.lynch@aiven.io" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "clickhouse-connect>=0.15.1",
+    "google-cloud-bigquery>=3.41.0",
+    "pydantic>=2.13.0",
+    "typer>=0.24.1",
+    "rich>=15.0.0",
+    "google-cloud-bigquery-datatransfer>=3.22.0",
+]
+
+[project.scripts]
+bq-ch-migrator = "bq_ch_migrator.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.8.12,<0.9.0"]
+build-backend = "uv_build"
