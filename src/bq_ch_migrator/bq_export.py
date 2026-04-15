@@ -39,14 +39,7 @@ def _run_export_query(bq_client: bigquery.Client, sql: str) -> None:
     console.print(f"[dim]{sql}[/dim]")
     query_job = bq_client.query(sql)
     query_job.result()
-    num_rows = query_job.num_dml_affected_rows
-    if num_rows is not None:
-        console.print(f"[green]Export complete. Rows exported: {num_rows}[/green]")
-    else:
-        console.print(
-            "[yellow]Warning: row count not available for this export.[/yellow]"
-        )
-        console.print("[green]Export complete.[/green]")
+    console.print("[green]Export complete.[/green]")
 
 
 def export_full_table(
@@ -183,13 +176,14 @@ def get_partition_info(
     )
 
 
-def get_latest_partition_id(
+def get_latest_partition_ids(
     bq_client: bigquery.Client,
     project: str,
     dataset: str,
     table: str,
-) -> str:
-    """Query INFORMATION_SCHEMA.PARTITIONS to find the latest non-empty partition."""
+    num_partitions: int = 1,
+) -> list[str]:
+    """Query INFORMATION_SCHEMA.PARTITIONS to find the N latest non-empty partitions."""
     sql = (
         f"SELECT partition_id "
         f"FROM `{project}.{dataset}.INFORMATION_SCHEMA.PARTITIONS` "
@@ -197,14 +191,14 @@ def get_latest_partition_id(
         f"  AND partition_id != '__NULL__' "
         f"  AND total_rows > 0 "
         f"ORDER BY partition_id DESC "
-        f"LIMIT 1"
+        f"LIMIT {num_partitions}"
     )
     rows = list(bq_client.query(sql).result())
     if not rows:
         raise ValueError(
             f"No non-empty partitions found for `{project}.{dataset}.{table}`."
         )
-    return rows[0].partition_id
+    return [row.partition_id for row in rows]
 
 
 _PARTITION_ID_FORMATS: dict[str, str] = {
@@ -259,9 +253,8 @@ def _partition_id_to_range(
 def _build_partition_filter(
     info: PartitionInfo,
     partition_id: str,
-    start_time: datetime | None,
 ) -> str:
-    """Build a WHERE clause that targets a partition, optionally narrowed by start_time."""
+    """Build a WHERE clause that targets a single partition."""
     start, end = _partition_id_to_range(partition_id, info.partition_type)
     sql_fmt = _PARTITION_SQL_FORMATS[info.partition_type]
 
@@ -270,84 +263,74 @@ def _build_partition_filter(
     else:
         col = f"`{info.column}`"
 
-    if start_time and start_time >= end:
-        raise ValueError(
-            f"--start-time {start_time.isoformat()} is after the latest partition "
-            f"({partition_id}) which ends at {end.isoformat()}. No data can be exported."
-        )
-
-    if start_time and start_time > start:
-        console.print(
-            f"[yellow]Warning: --start-time {start_time.isoformat()} is after the "
-            f"partition start ({start.isoformat()}). Only a subset of the partition "
-            f"will be exported.[/yellow]"
-        )
-
-    lower_bound = start_time if start_time and start_time > start else start
-
-    if start_time:
-        return f"WHERE {col} >= '{lower_bound.strftime(sql_fmt)}'"
-
-    return f"WHERE {col} >= '{lower_bound.strftime(sql_fmt)}' "
+    return (
+        f"WHERE {col} >= '{start.strftime(sql_fmt)}' "
+        f"AND {col} < '{end.strftime(sql_fmt)}'"
+    )
 
 
-def export_latest_partition(
+def export_partitions(
     bq_client: bigquery.Client,
     project: str,
     dataset: str,
     table: str,
     storage: StorageConfig,
-    start_time: datetime | None = None,
+    num_partitions: int = 1,
     fields: list[bigquery.SchemaField] | None = None,
-) -> str:
-    """Export the latest partition of a partitioned BigQuery table.
+) -> list[str]:
+    """Export the N latest partitions of a partitioned BigQuery table.
 
-    If start_time is provided, only rows within the partition that are
-    >= start_time are exported (useful for re-exports or partial syncs).
+    Returns the list of exported partition IDs.
     """
     info = get_partition_info(bq_client, project, dataset, table)
-    partition_id = get_latest_partition_id(bq_client, project, dataset, table)
-    where = _build_partition_filter(info, partition_id, start_time)
+    partition_ids = get_latest_partition_ids(
+        bq_client, project, dataset, table, num_partitions=num_partitions
+    )
 
     console.print(
         f"[bold]Partition info:[/bold] type={info.partition_type}, "
-        f"column={'_PARTITIONTIME' if info.is_ingestion_time else info.column}, "
-        f"latest_id={partition_id}"
+        f"column={'_PARTITIONTIME' if info.is_ingestion_time else info.column}"
     )
-    if start_time:
-        console.print(
-            f"[bold]Filtering from start_time:[/bold] {start_time.isoformat()}"
-        )
+    console.print(
+        f"[bold]Exporting {len(partition_ids)} partition(s):[/bold] "
+        f"{', '.join(partition_ids)}"
+    )
 
-    dest_uri = storage.bq_export_uri(suffix=f"partition_{partition_id}/*.parquet")
     source = f"`{project}.{dataset}.{table}`"
     select = build_select_list(fields, source) if fields else f"SELECT * FROM {source}"
 
-    if storage.storage_type == StorageType.S3:
-        if not storage.bq_connection:
-            raise ValueError("--bq-connection is required when using S3 storage type")
-        sql = (
-            f"EXPORT DATA\n"
-            f"  WITH CONNECTION `{storage.bq_connection}`\n"
-            f"  OPTIONS(\n"
-            f"    uri='{dest_uri}',\n"
-            f"    format='PARQUET',\n"
-            f"    compression='SNAPPY',\n"
-            f"    overwrite=true\n"
-            f"  ) AS\n"
-            f"{select}\n{where}"
-        )
-    else:
-        sql = (
-            f"EXPORT DATA\n"
-            f"  OPTIONS(\n"
-            f"    uri='{dest_uri}',\n"
-            f"    format='PARQUET',\n"
-            f"    compression='SNAPPY',\n"
-            f"    overwrite=true\n"
-            f"  ) AS\n"
-            f"{select}\n{where}"
-        )
+    for partition_id in partition_ids:
+        where = _build_partition_filter(info, partition_id)
+        dest_uri = storage.bq_export_uri(suffix=f"partition_{partition_id}/*.parquet")
 
-    _run_export_query(bq_client, sql)
-    return partition_id
+        if storage.storage_type == StorageType.S3:
+            if not storage.bq_connection:
+                raise ValueError(
+                    "--bq-connection is required when using S3 storage type"
+                )
+            sql = (
+                f"EXPORT DATA\n"
+                f"  WITH CONNECTION `{storage.bq_connection}`\n"
+                f"  OPTIONS(\n"
+                f"    uri='{dest_uri}',\n"
+                f"    format='PARQUET',\n"
+                f"    compression='SNAPPY',\n"
+                f"    overwrite=true\n"
+                f"  ) AS\n"
+                f"{select}\n{where}"
+            )
+        else:
+            sql = (
+                f"EXPORT DATA\n"
+                f"  OPTIONS(\n"
+                f"    uri='{dest_uri}',\n"
+                f"    format='PARQUET',\n"
+                f"    compression='SNAPPY',\n"
+                f"    overwrite=true\n"
+                f"  ) AS\n"
+                f"{select}\n{where}"
+            )
+
+        _run_export_query(bq_client, sql)
+
+    return partition_ids

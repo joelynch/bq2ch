@@ -11,7 +11,7 @@ from rich.console import Console
 from bq_ch_migrator.bq_export import (
     export_full_table,
     export_incremental,
-    export_latest_partition,
+    export_partitions,
     get_bq_row_count,
 )
 from bq_ch_migrator.bq_ingest import (
@@ -263,20 +263,18 @@ def snapshot_partition(
     bq_connection: BqConnection = None,
     order_by: OrderBy = None,
     partition_by: PartitionBy = None,
-    start_time: Annotated[
-        Optional[datetime],
+    num_partitions: Annotated[
+        int,
         typer.Option(
-            "--start-time",
-            formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"],
-            help="Only export rows >= this timestamp within the latest partition (ISO format)",
+            "--num-partitions",
+            help="Number of latest partitions to export (default: 1)",
         ),
-    ] = None,
+    ] = 1,
 ) -> None:
-    """Export the latest partition of a partitioned BQ table into ClickHouse.
+    """Export the N latest partitions of a partitioned BQ table into ClickHouse.
 
     Automatically detects how the table is partitioned (column or ingestion-time)
-    and exports only the most recent non-empty partition. If --start-time is given,
-    further narrows the export to rows >= that timestamp within the partition.
+    and exports the most recent non-empty partitions.
     """
     if not ch_table:
         ch_table = bq_table
@@ -318,19 +316,22 @@ def snapshot_partition(
         ch_client, ch_cfg, fields, order_by=order_by, partition_by=partition_by
     )
 
-    # 3. Export latest partition from BigQuery
-    partition_id = export_latest_partition(
+    # 3. Export latest partition(s) from BigQuery
+    partition_ids = export_partitions(
         bq_client,
         bq_project,
         bq_dataset,
         bq_table,
         storage,
-        start_time=start_time,
+        num_partitions=num_partitions,
         fields=fields,
     )
 
     # 4. Ingest into ClickHouse
-    ingest_from_storage(ch_client, ch_cfg, storage, suffix=f"partition_{partition_id}/*.parquet")
+    for partition_id in partition_ids:
+        ingest_from_storage(
+            ch_client, ch_cfg, storage, suffix=f"partition_{partition_id}/*.parquet"
+        )
 
     console.print(f"\n[bold green]Partition snapshot complete.[/bold green]")
 
