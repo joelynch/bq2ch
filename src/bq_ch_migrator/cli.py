@@ -11,6 +11,7 @@ from rich.console import Console
 from bq_ch_migrator.bq_export import (
     export_full_table,
     export_incremental,
+    export_latest_partition,
     get_bq_row_count,
 )
 from bq_ch_migrator.bq_scheduled import (
@@ -143,7 +144,7 @@ def snapshot(
     storage_access_key: StorageAccessKey,
     storage_secret_key: StorageSecretKey,
     ch_host: ChHost,
-    ch_port: ChPort = 8443,
+    ch_port: ChPort ,
     ch_user: ChUser = "default",
     ch_password: ChPassword = "",
     ch_database: ChDatabase = "default",
@@ -211,6 +212,91 @@ def snapshot(
         console.print("[yellow bold]Warning: row counts differ.[/yellow bold]")
 
 
+@app.command(name="snapshot-partition")
+def snapshot_partition(
+    bq_project: BqProject,
+    bq_dataset: BqDataset,
+    bq_table: BqTable,
+    storage_type: StorageTypeOpt,
+    bucket: Bucket,
+    bucket_path: BucketPath,
+    storage_access_key: StorageAccessKey,
+    storage_secret_key: StorageSecretKey,
+    ch_host: ChHost,
+    ch_port: ChPort ,
+    ch_user: ChUser = "default",
+    ch_password: ChPassword = "",
+    ch_database: ChDatabase = "default",
+    ch_table: ChTable = "",
+    ch_cluster: ChCluster = "",
+    ch_secure: ChSecure = True,
+    bq_connection: BqConnection = None,
+    order_by: OrderBy = None,
+    partition_by: PartitionBy = None,
+    start_time: Annotated[
+        Optional[datetime],
+        typer.Option(
+            "--start-time",
+            formats=["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"],
+            help="Only export rows >= this timestamp within the latest partition (ISO format)",
+        ),
+    ] = None,
+) -> None:
+    """Export the latest partition of a partitioned BQ table into ClickHouse.
+
+    Automatically detects how the table is partitioned (column or ingestion-time)
+    and exports only the most recent non-empty partition. If --start-time is given,
+    further narrows the export to rows >= that timestamp within the partition.
+    """
+    if not ch_table:
+        ch_table = bq_table
+    if not ch_cluster:
+        typer.echo("Error: --ch-cluster is required.", err=True)
+        raise typer.Exit(1)
+
+    storage = StorageConfig(
+        storage_type=storage_type,
+        bucket=bucket,
+        bucket_path=bucket_path,
+        access_key=storage_access_key,
+        secret_key=storage_secret_key,
+        bq_connection=bq_connection,
+    )
+    ch_cfg = ClickHouseConfig(
+        host=ch_host,
+        port=ch_port,
+        username=ch_user,
+        password=ch_password,
+        database=ch_database,
+        table=ch_table,
+        cluster=ch_cluster,
+        secure=ch_secure,
+    )
+
+    bq_client = bigquery.Client(project=bq_project)
+
+    # 1. Introspect schema
+    console.print("[bold]Introspecting BigQuery schema...[/bold]")
+    fields = introspect_bq_schema(bq_client, bq_project, bq_dataset, bq_table)
+    console.print(f"  Found {len(fields)} columns.")
+
+    # 2. Create ClickHouse table
+    ch_client = get_ch_client(ch_cfg)
+    create_destination_table(
+        ch_client, ch_cfg, fields, order_by=order_by, partition_by=partition_by
+    )
+
+    # 3. Export latest partition from BigQuery
+    export_latest_partition(
+        bq_client, bq_project, bq_dataset, bq_table, storage, start_time=start_time
+    )
+
+    # 4. Ingest into ClickHouse
+    ingest_from_storage(ch_client, ch_cfg, storage)
+
+    console.print(f"\n[bold green]Partition snapshot complete.[/bold green]")
+
+
 @app.command()
 def cdc(
     bq_project: BqProject,
@@ -229,7 +315,7 @@ def cdc(
         ),
     ],
     ch_host: ChHost,
-    ch_port: ChPort = 8443,
+    ch_port: ChPort ,
     ch_user: ChUser = "default",
     ch_password: ChPassword = "",
     ch_database: ChDatabase = "default",
@@ -393,7 +479,7 @@ def scheduled_cdc(
         ),
     ],
     ch_host: ChHost,
-    ch_port: ChPort = 8443,
+    ch_port: ChPort ,
     ch_user: ChUser = "default",
     ch_password: ChPassword = "",
     ch_database: ChDatabase = "default",

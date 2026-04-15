@@ -16,7 +16,7 @@ class BigQueryConfig(BaseModel):
 
 class ClickHouseConfig(BaseModel):
     host: str
-    port: int = 8443
+    port: int 
     username: str = "default"
     password: str = ""
     database: str = "default"
