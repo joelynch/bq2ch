@@ -18,6 +18,7 @@ BQ_TO_CH_TYPE_MAP: dict[str, str] = {
     "TIMESTAMP": "DateTime64(6, 'UTC')",
     "GEOGRAPHY": "String",
     "JSON": "String",
+    "INTERVAL": "String",
     "RANGE": "String",
 }
 

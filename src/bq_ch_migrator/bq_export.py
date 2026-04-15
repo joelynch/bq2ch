@@ -14,18 +14,20 @@ def build_select_list(
     fields: list[bigquery.SchemaField],
     source: str,
 ) -> str:
-    """Build a SELECT column list, casting JSON columns to STRING.
+    """Build a SELECT column list, casting unsupported Parquet types to STRING.
 
-    Returns 'SELECT *' if no JSON columns are present, otherwise returns
-    an explicit column list with CAST(col AS STRING) for JSON fields.
+    BigQuery cannot export JSON, RANGE, or INTERVAL columns to Parquet directly.
+    Returns 'SELECT *' if no problematic columns are present, otherwise returns
+    an explicit column list with CAST(col AS STRING) for those fields.
     """
-    has_json = any(f.field_type == "JSON" for f in fields)
-    if not has_json:
+    _CAST_TO_STRING_TYPES = {"JSON", "RANGE", "INTERVAL"}
+    needs_cast = any(f.field_type in _CAST_TO_STRING_TYPES for f in fields)
+    if not needs_cast:
         return f"SELECT * FROM {source}"
 
     cols = []
     for f in fields:
-        if f.field_type == "JSON":
+        if f.field_type in _CAST_TO_STRING_TYPES:
             cols.append(f"CAST(`{f.name}` AS STRING) AS `{f.name}`")
         else:
             cols.append(f"`{f.name}`")
@@ -266,9 +268,7 @@ def _build_partition_filter(
     if start_time:
         return f"WHERE {col} >= '{lower_bound.strftime(sql_fmt)}'"
 
-    return (
-        f"WHERE {col} >= '{lower_bound.strftime(sql_fmt)}' "
-    )
+    return f"WHERE {col} >= '{lower_bound.strftime(sql_fmt)}' "
 
 
 def export_latest_partition(
@@ -289,11 +289,15 @@ def export_latest_partition(
     partition_id = get_latest_partition_id(bq_client, project, dataset, table)
     where = _build_partition_filter(info, partition_id, start_time)
 
-    console.print(f"[bold]Partition info:[/bold] type={info.partition_type}, "
-                  f"column={'_PARTITIONTIME' if info.is_ingestion_time else info.column}, "
-                  f"latest_id={partition_id}")
+    console.print(
+        f"[bold]Partition info:[/bold] type={info.partition_type}, "
+        f"column={'_PARTITIONTIME' if info.is_ingestion_time else info.column}, "
+        f"latest_id={partition_id}"
+    )
     if start_time:
-        console.print(f"[bold]Filtering from start_time:[/bold] {start_time.isoformat()}")
+        console.print(
+            f"[bold]Filtering from start_time:[/bold] {start_time.isoformat()}"
+        )
 
     dest_uri = storage.bq_export_uri(suffix=f"partition_{partition_id}/*.parquet")
     source = f"`{project}.{dataset}.{table}`"
