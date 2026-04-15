@@ -305,6 +305,8 @@ def snapshot_partition(
 
     bq_client = bigquery.Client(project=bq_project)
 
+    console.print(f"[bold]BigQuery table:[/bold] {bq_project}.{bq_dataset}.{bq_table}")
+
     # 1. Introspect schema
     console.print("[bold]Introspecting BigQuery schema...[/bold]")
     fields = introspect_bq_schema(bq_client, bq_project, bq_dataset, bq_table)
@@ -317,7 +319,7 @@ def snapshot_partition(
     )
 
     # 3. Export latest partition from BigQuery
-    export_latest_partition(
+    partition_id = export_latest_partition(
         bq_client,
         bq_project,
         bq_dataset,
@@ -328,7 +330,7 @@ def snapshot_partition(
     )
 
     # 4. Ingest into ClickHouse
-    ingest_from_storage(ch_client, ch_cfg, storage)
+    ingest_from_storage(ch_client, ch_cfg, storage, suffix=f"partition_{partition_id}/*.parquet")
 
     console.print(f"\n[bold green]Partition snapshot complete.[/bold green]")
 

@@ -45,8 +45,9 @@ def ingest_from_storage(
     ch_client: Client,
     ch_cfg: ClickHouseConfig,
     storage: StorageConfig,
+    suffix: str = "*.parquet",
 ) -> None:
-    url = storage.ch_storage_url()
+    url = storage.ch_storage_url(suffix=suffix)
     sql = (
         f"INSERT INTO `{ch_cfg.database}`.`{ch_cfg.table}`\n"
         f"SELECT * FROM s3Cluster(\n"

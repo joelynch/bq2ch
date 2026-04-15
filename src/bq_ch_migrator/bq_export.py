@@ -18,7 +18,7 @@ def build_select_list(
 
     BigQuery cannot export JSON, RANGE, or INTERVAL columns to Parquet directly.
     Returns 'SELECT *' if no problematic columns are present, otherwise returns
-    an explicit column list with CAST(col AS STRING) for those fields.
+    an explicit column list with TO_JSON_STRING(col) for those fields.
     """
     _CAST_TO_STRING_TYPES = {"JSON", "RANGE", "INTERVAL"}
     needs_cast = any(f.field_type in _CAST_TO_STRING_TYPES for f in fields)
@@ -28,7 +28,7 @@ def build_select_list(
     cols = []
     for f in fields:
         if f.field_type in _CAST_TO_STRING_TYPES:
-            cols.append(f"CAST(`{f.name}` AS STRING) AS `{f.name}`")
+            cols.append(f"TO_JSON_STRING(`{f.name}`) AS `{f.name}`")
         else:
             cols.append(f"`{f.name}`")
     return f"SELECT {', '.join(cols)} FROM {source}"
@@ -39,7 +39,14 @@ def _run_export_query(bq_client: bigquery.Client, sql: str) -> None:
     console.print(f"[dim]{sql}[/dim]")
     query_job = bq_client.query(sql)
     query_job.result()
-    console.print("[green]Export complete.[/green]")
+    num_rows = query_job.num_dml_affected_rows
+    if num_rows is not None:
+        console.print(f"[green]Export complete. Rows exported: {num_rows}[/green]")
+    else:
+        console.print(
+            "[yellow]Warning: row count not available for this export.[/yellow]"
+        )
+        console.print("[green]Export complete.[/green]")
 
 
 def export_full_table(
@@ -263,6 +270,19 @@ def _build_partition_filter(
     else:
         col = f"`{info.column}`"
 
+    if start_time and start_time >= end:
+        raise ValueError(
+            f"--start-time {start_time.isoformat()} is after the latest partition "
+            f"({partition_id}) which ends at {end.isoformat()}. No data can be exported."
+        )
+
+    if start_time and start_time > start:
+        console.print(
+            f"[yellow]Warning: --start-time {start_time.isoformat()} is after the "
+            f"partition start ({start.isoformat()}). Only a subset of the partition "
+            f"will be exported.[/yellow]"
+        )
+
     lower_bound = start_time if start_time and start_time > start else start
 
     if start_time:
@@ -330,4 +350,4 @@ def export_latest_partition(
         )
 
     _run_export_query(bq_client, sql)
-    return dest_uri
+    return partition_id
