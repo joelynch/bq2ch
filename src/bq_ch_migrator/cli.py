@@ -14,10 +14,21 @@ from bq_ch_migrator.bq_export import (
     export_latest_partition,
     get_bq_row_count,
 )
+from bq_ch_migrator.bq_ingest import (
+    create_scheduled_load,
+    delete_cloud_function,
+    deploy_cloud_function,
+    load_from_gcs,
+)
 from bq_ch_migrator.bq_scheduled import (
     create_scheduled_export,
     delete_scheduled_export,
     list_scheduled_exports,
+)
+from bq_ch_migrator.ch_export import (
+    export_snapshot as ch_export_snapshot,
+    setup_export_mv,
+    setup_s3_export_table,
 )
 from bq_ch_migrator.ch_ingest import (
     create_destination_table,
@@ -27,14 +38,31 @@ from bq_ch_migrator.ch_ingest import (
     setup_s3queue,
 )
 from bq_ch_migrator.config import ClickHouseConfig, StorageConfig, StorageType
-from bq_ch_migrator.schema import introspect_bq_schema
+from bq_ch_migrator.schema import (
+    create_bq_table,
+    generate_bq_schema,
+    introspect_bq_schema,
+    introspect_ch_schema,
+)
 from bq_ch_migrator.watermark import WatermarkState, get_current_max_watermark
 
 app = typer.Typer(
     name="bq-ch-migrator",
-    help="Migrate BigQuery tables to ClickHouse via GCS or S3.",
+    help="Migrate tables between BigQuery and ClickHouse via GCS or S3.",
     rich_markup_mode="rich",
 )
+bq2ch_app = typer.Typer(
+    name="bq2ch",
+    help="Migrate BigQuery tables → ClickHouse.",
+    rich_markup_mode="rich",
+)
+ch2bq_app = typer.Typer(
+    name="ch2bq",
+    help="Migrate ClickHouse tables → BigQuery.",
+    rich_markup_mode="rich",
+)
+app.add_typer(bq2ch_app, name="bq2ch")
+app.add_typer(ch2bq_app, name="ch2bq")
 console = Console()
 
 # ── Shared option types ─────────────────────────────────────────────────────
@@ -133,7 +161,7 @@ PartitionBy = Annotated[
 ]
 
 
-@app.command()
+@bq2ch_app.command()
 def snapshot(
     bq_project: BqProject,
     bq_dataset: BqDataset,
@@ -214,7 +242,7 @@ def snapshot(
         console.print("[yellow bold]Warning: row counts differ.[/yellow bold]")
 
 
-@app.command(name="snapshot-partition")
+@bq2ch_app.command(name="snapshot-partition")
 def snapshot_partition(
     bq_project: BqProject,
     bq_dataset: BqDataset,
@@ -305,7 +333,7 @@ def snapshot_partition(
     console.print(f"\n[bold green]Partition snapshot complete.[/bold green]")
 
 
-@app.command()
+@bq2ch_app.command()
 def cdc(
     bq_project: BqProject,
     bq_dataset: BqDataset,
@@ -472,7 +500,7 @@ def cdc(
     )
 
 
-@app.command(name="scheduled-cdc")
+@bq2ch_app.command(name="scheduled-cdc")
 def scheduled_cdc(
     bq_project: BqProject,
     bq_dataset: BqDataset,
@@ -647,6 +675,384 @@ def list_schedules(
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("[%H:%M:%S]")
+
+
+# ── ch2bq commands ──────────────────────────────────────────────────────────
+
+# Reuse shared option types (BQ, CH, Storage) defined above.
+# Additional option types for ch2bq direction:
+
+ChSourceTable = Annotated[
+    str,
+    typer.Option(
+        "--ch-source-table",
+        envvar="CH_SOURCE_TABLE",
+        help="ClickHouse source table to export",
+    ),
+]
+
+
+@ch2bq_app.command(name="snapshot")
+def ch2bq_snapshot(
+    bq_project: BqProject,
+    bq_dataset: BqDataset,
+    bq_table: BqTable,
+    storage_type: StorageTypeOpt,
+    bucket: Bucket,
+    bucket_path: BucketPath,
+    storage_access_key: StorageAccessKey,
+    storage_secret_key: StorageSecretKey,
+    ch_host: ChHost,
+    ch_port: ChPort,
+    ch_source_table: ChSourceTable,
+    ch_user: ChUser = "default",
+    ch_password: ChPassword = "",
+    ch_database: ChDatabase = "default",
+    ch_cluster: ChCluster = "",
+    ch_secure: ChSecure = True,
+    bq_connection: BqConnection = None,
+) -> None:
+    """One-off full table migration: ClickHouse → Parquet in GCS/S3 → BigQuery."""
+    if not ch_cluster:
+        typer.echo("Error: --ch-cluster is required.", err=True)
+        raise typer.Exit(1)
+
+    storage = StorageConfig(
+        storage_type=storage_type,
+        bucket=bucket,
+        bucket_path=bucket_path,
+        access_key=storage_access_key,
+        secret_key=storage_secret_key,
+        bq_connection=bq_connection,
+    )
+    ch_cfg = ClickHouseConfig(
+        host=ch_host,
+        port=ch_port,
+        username=ch_user,
+        password=ch_password,
+        database=ch_database,
+        table=ch_source_table,
+        cluster=ch_cluster,
+        secure=ch_secure,
+    )
+
+    # 1. Introspect ClickHouse schema
+    console.print("[bold]Introspecting ClickHouse schema...[/bold]")
+    ch_client = get_ch_client(ch_cfg)
+    ch_columns = introspect_ch_schema(ch_client, ch_cfg.database, ch_cfg.table)
+    console.print(f"  Found {len(ch_columns)} columns.")
+
+    # 2. Create BigQuery destination table
+    bq_client = bigquery.Client(project=bq_project)
+    bq_schema = generate_bq_schema(ch_columns)
+    create_bq_table(bq_client, bq_project, bq_dataset, bq_table, bq_schema)
+    console.print(
+        f"[green]BigQuery table `{bq_project}.{bq_dataset}.{bq_table}` ready.[/green]"
+    )
+
+    # 3. Export ClickHouse → GCS/S3
+    ch_export_snapshot(ch_client, ch_cfg, storage)
+
+    # 4. Load GCS → BigQuery
+    gcs_uri = storage.bq_load_uri()
+    load_from_gcs(bq_client, bq_project, bq_dataset, bq_table, gcs_uri)
+
+    # 5. Verify
+    ch_count = get_ch_row_count(ch_client, ch_cfg.database, ch_cfg.table)
+    bq_tbl = bq_client.get_table(f"{bq_project}.{bq_dataset}.{bq_table}")
+    bq_count = bq_tbl.num_rows
+    console.print(f"\n[bold]Verification:[/bold]")
+    console.print(f"  ClickHouse rows: {ch_count:,}")
+    console.print(f"  BigQuery rows:   {bq_count:,}")
+    if bq_count == ch_count:
+        console.print("[green bold]Row counts match![/green bold]")
+    else:
+        console.print("[yellow bold]Warning: row counts differ.[/yellow bold]")
+
+
+@ch2bq_app.command(name="scheduled-cdc")
+def ch2bq_scheduled_cdc(
+    bq_project: BqProject,
+    bq_dataset: BqDataset,
+    bq_table: BqTable,
+    storage_type: StorageTypeOpt,
+    bucket: Bucket,
+    bucket_path: BucketPath,
+    storage_access_key: StorageAccessKey,
+    storage_secret_key: StorageSecretKey,
+    ch_host: ChHost,
+    ch_port: ChPort,
+    ch_source_table: ChSourceTable,
+    partition_column: Annotated[
+        str,
+        typer.Option(
+            "--partition-column",
+            help="ClickHouse column for time-partitioned GCS paths (e.g. created_at)",
+        ),
+    ],
+    ch_user: ChUser = "default",
+    ch_password: ChPassword = "",
+    ch_database: ChDatabase = "default",
+    ch_cluster: ChCluster = "",
+    ch_secure: ChSecure = True,
+    bq_connection: BqConnection = None,
+    schedule: Annotated[
+        str,
+        typer.Option(
+            "--schedule",
+            help="Schedule for BQ Data Transfer load (e.g. 'every 1 hours')",
+        ),
+    ] = "every 1 hours",
+    bq_location: Annotated[
+        str,
+        typer.Option(
+            "--bq-location",
+            envvar="BQ_LOCATION",
+            help="BigQuery location/region (e.g. US, europe-west1)",
+        ),
+    ] = "US",
+    service_account: Annotated[
+        Optional[str],
+        typer.Option(
+            "--service-account",
+            help="GCP service account email for the scheduled load",
+        ),
+    ] = None,
+) -> None:
+    """Scheduled CDC: ClickHouse MV writes Parquet to time-partitioned GCS paths → BQ Data Transfer Service loads on schedule.
+
+    Creates an S3 engine table + Materialized View on ClickHouse that continuously
+    writes Parquet files to time-partitioned GCS paths. A BigQuery Data Transfer
+    Service scheduled load picks up new files using ``{run_time}`` parameterized paths.
+    """
+    if not ch_cluster:
+        typer.echo("Error: --ch-cluster is required.", err=True)
+        raise typer.Exit(1)
+
+    storage = StorageConfig(
+        storage_type=storage_type,
+        bucket=bucket,
+        bucket_path=bucket_path,
+        access_key=storage_access_key,
+        secret_key=storage_secret_key,
+        bq_connection=bq_connection,
+    )
+    ch_cfg = ClickHouseConfig(
+        host=ch_host,
+        port=ch_port,
+        username=ch_user,
+        password=ch_password,
+        database=ch_database,
+        table=ch_source_table,
+        cluster=ch_cluster,
+        secure=ch_secure,
+    )
+
+    # 1. Introspect ClickHouse schema
+    console.print("[bold]Introspecting ClickHouse schema...[/bold]")
+    ch_client = get_ch_client(ch_cfg)
+    ch_columns = introspect_ch_schema(ch_client, ch_cfg.database, ch_cfg.table)
+    console.print(f"  Found {len(ch_columns)} columns.")
+
+    # 2. Create BigQuery destination table
+    bq_client = bigquery.Client(project=bq_project)
+    bq_schema = generate_bq_schema(ch_columns)
+    create_bq_table(bq_client, bq_project, bq_dataset, bq_table, bq_schema)
+    console.print(
+        f"[green]BigQuery table `{bq_project}.{bq_dataset}.{bq_table}` ready.[/green]"
+    )
+
+    # 3. Create S3 engine table with time partitioning on CH
+    # Build columns DDL from the introspected CH types (they are already CH types)
+    columns_ddl = "\n".join(
+        f"    `{name}` {ch_type}," for name, ch_type in ch_columns
+    ).rstrip(",")
+    partition_expr = f"toDate(`{partition_column}`)"
+    export_table = setup_s3_export_table(
+        ch_client, ch_cfg, storage, columns_ddl, partition_expr=partition_expr
+    )
+
+    # 4. Create MV: source → S3 export
+    setup_export_mv(ch_client, ch_cfg, ch_source_table, export_table)
+
+    # 5. Initial snapshot: CH → GCS → BQ
+    console.print("[bold]Running initial snapshot load...[/bold]")
+    ch_export_snapshot(ch_client, ch_cfg, storage)
+    gcs_uri = storage.bq_load_uri()
+    load_from_gcs(bq_client, bq_project, bq_dataset, bq_table, gcs_uri)
+
+    # 6. Create BQ DTS scheduled load
+    transfer_name = create_scheduled_load(
+        project=bq_project,
+        location=bq_location,
+        dataset=bq_dataset,
+        table=bq_table,
+        storage=storage,
+        schedule=schedule,
+        service_account=service_account,
+    )
+
+    console.print(f"\n[bold green]Setup complete![/bold green]")
+    console.print(f"  BQ scheduled load: {transfer_name}")
+    console.print(f"  Schedule: {schedule}")
+    console.print(f"  ClickHouse MV will write Parquet to time-partitioned GCS paths.")
+    console.print(
+        f"  BQ Data Transfer Service will pick up files matching "
+        f"dt={{run_time}} on each run."
+    )
+    console.print(
+        f"\n  To remove the scheduled load later:\n"
+        f"    bq-ch-migrator delete-schedule --transfer-config-name '{transfer_name}'"
+    )
+
+
+@ch2bq_app.command(name="event-driven")
+def ch2bq_event_driven(
+    bq_project: BqProject,
+    bq_dataset: BqDataset,
+    bq_table: BqTable,
+    storage_type: StorageTypeOpt,
+    bucket: Bucket,
+    bucket_path: BucketPath,
+    storage_access_key: StorageAccessKey,
+    storage_secret_key: StorageSecretKey,
+    ch_host: ChHost,
+    ch_port: ChPort,
+    ch_source_table: ChSourceTable,
+    ch_user: ChUser = "default",
+    ch_password: ChPassword = "",
+    ch_database: ChDatabase = "default",
+    ch_cluster: ChCluster = "",
+    ch_secure: ChSecure = True,
+    bq_connection: BqConnection = None,
+    cf_region: Annotated[
+        str,
+        typer.Option(
+            "--cf-region",
+            help="GCP region for the Cloud Function",
+        ),
+    ] = "us-central1",
+    cf_name: Annotated[
+        str,
+        typer.Option(
+            "--cf-name",
+            help="Cloud Function name (auto-generated if empty)",
+        ),
+    ] = "",
+    service_account: Annotated[
+        Optional[str],
+        typer.Option(
+            "--service-account",
+            help="GCP service account for the Cloud Function",
+        ),
+    ] = None,
+) -> None:
+    """Event-driven CDC: ClickHouse MV writes Parquet to GCS → Cloud Function triggers BQ load on each file.
+
+    Creates an S3 engine table + Materialized View on ClickHouse that writes Parquet
+    to GCS. A Cloud Function (gen2, Eventarc) fires on each file finalization and
+    submits a BigQuery load job. Near-real-time with no polling.
+    """
+    if not ch_cluster:
+        typer.echo("Error: --ch-cluster is required.", err=True)
+        raise typer.Exit(1)
+
+    if not cf_name:
+        cf_name = f"bq-ch-migrator-{bq_dataset}-{bq_table}".replace("_", "-").lower()
+
+    storage = StorageConfig(
+        storage_type=storage_type,
+        bucket=bucket,
+        bucket_path=bucket_path,
+        access_key=storage_access_key,
+        secret_key=storage_secret_key,
+        bq_connection=bq_connection,
+    )
+    ch_cfg = ClickHouseConfig(
+        host=ch_host,
+        port=ch_port,
+        username=ch_user,
+        password=ch_password,
+        database=ch_database,
+        table=ch_source_table,
+        cluster=ch_cluster,
+        secure=ch_secure,
+    )
+
+    # 1. Introspect ClickHouse schema
+    console.print("[bold]Introspecting ClickHouse schema...[/bold]")
+    ch_client = get_ch_client(ch_cfg)
+    ch_columns = introspect_ch_schema(ch_client, ch_cfg.database, ch_cfg.table)
+    console.print(f"  Found {len(ch_columns)} columns.")
+
+    # 2. Create BigQuery destination table
+    bq_client = bigquery.Client(project=bq_project)
+    bq_schema = generate_bq_schema(ch_columns)
+    create_bq_table(bq_client, bq_project, bq_dataset, bq_table, bq_schema)
+    console.print(
+        f"[green]BigQuery table `{bq_project}.{bq_dataset}.{bq_table}` ready.[/green]"
+    )
+
+    # 3. Create S3 engine table (flat path, no time partitioning)
+    columns_ddl = "\n".join(
+        f"    `{name}` {ch_type}," for name, ch_type in ch_columns
+    ).rstrip(",")
+    export_table = setup_s3_export_table(ch_client, ch_cfg, storage, columns_ddl)
+
+    # 4. Create MV: source → S3 export
+    setup_export_mv(ch_client, ch_cfg, ch_source_table, export_table)
+
+    # 5. Initial snapshot: CH → GCS → BQ
+    console.print("[bold]Running initial snapshot load...[/bold]")
+    ch_export_snapshot(ch_client, ch_cfg, storage)
+    gcs_uri = storage.bq_load_uri()
+    load_from_gcs(bq_client, bq_project, bq_dataset, bq_table, gcs_uri)
+
+    # 6. Deploy Cloud Function
+    deploy_cloud_function(
+        gcp_project=bq_project,
+        region=cf_region,
+        bucket=bucket,
+        bq_project=bq_project,
+        bq_dataset=bq_dataset,
+        bq_table=bq_table,
+        function_name=cf_name,
+        service_account=service_account,
+    )
+
+    console.print(f"\n[bold green]Setup complete![/bold green]")
+    console.print(f"  ClickHouse MV will write Parquet files to GCS on every INSERT.")
+    console.print(
+        f"  Cloud Function '{cf_name}' will trigger a BQ load job for each file."
+    )
+    console.print(
+        f"\n  To remove the Cloud Function later:\n"
+        f"    bq-ch-migrator delete-cloud-function "
+        f"--gcp-project '{bq_project}' --region '{cf_region}' --function-name '{cf_name}'"
+    )
+
+
+@app.command(name="delete-cloud-function")
+def delete_cf(
+    gcp_project: Annotated[
+        str,
+        typer.Option(
+            "--gcp-project",
+            envvar="GCP_PROJECT",
+            help="GCP project containing the Cloud Function",
+        ),
+    ],
+    region: Annotated[
+        str,
+        typer.Option("--region", help="GCP region of the Cloud Function"),
+    ],
+    function_name: Annotated[
+        str,
+        typer.Option("--function-name", help="Name of the Cloud Function to delete"),
+    ],
+) -> None:
+    """Delete a Cloud Function deployed by ch2bq event-driven."""
+    delete_cloud_function(gcp_project, region, function_name)
 
 
 if __name__ == "__main__":

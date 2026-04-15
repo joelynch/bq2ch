@@ -120,7 +120,7 @@ def list_scheduled_exports(
     for config in client.list_transfer_configs(
         request=bigquery_datatransfer.ListTransferConfigsRequest(
             parent=parent,
-            data_source_ids=["scheduled_query"],
+            data_source_ids=["scheduled_query", "google_cloud_storage"],
         )
     ):
         if config.display_name.startswith("bq-ch-migrator:"):
