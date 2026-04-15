@@ -144,7 +144,7 @@ def snapshot(
     storage_access_key: StorageAccessKey,
     storage_secret_key: StorageSecretKey,
     ch_host: ChHost,
-    ch_port: ChPort ,
+    ch_port: ChPort,
     ch_user: ChUser = "default",
     ch_password: ChPassword = "",
     ch_database: ChDatabase = "default",
@@ -195,7 +195,9 @@ def snapshot(
     )
 
     # 3. Export from BigQuery
-    export_full_table(bq_client, bq_project, bq_dataset, bq_table, storage)
+    export_full_table(
+        bq_client, bq_project, bq_dataset, bq_table, storage, fields=fields
+    )
 
     # 4. Ingest into ClickHouse
     ingest_from_storage(ch_client, ch_cfg, storage)
@@ -223,7 +225,7 @@ def snapshot_partition(
     storage_access_key: StorageAccessKey,
     storage_secret_key: StorageSecretKey,
     ch_host: ChHost,
-    ch_port: ChPort ,
+    ch_port: ChPort,
     ch_user: ChUser = "default",
     ch_password: ChPassword = "",
     ch_database: ChDatabase = "default",
@@ -288,7 +290,13 @@ def snapshot_partition(
 
     # 3. Export latest partition from BigQuery
     export_latest_partition(
-        bq_client, bq_project, bq_dataset, bq_table, storage, start_time=start_time
+        bq_client,
+        bq_project,
+        bq_dataset,
+        bq_table,
+        storage,
+        start_time=start_time,
+        fields=fields,
     )
 
     # 4. Ingest into ClickHouse
@@ -315,7 +323,7 @@ def cdc(
         ),
     ],
     ch_host: ChHost,
-    ch_port: ChPort ,
+    ch_port: ChPort,
     ch_user: ChUser = "default",
     ch_password: ChPassword = "",
     ch_database: ChDatabase = "default",
@@ -389,7 +397,9 @@ def cdc(
         console.print(
             "[bold]No previous watermark found. Starting initial export...[/bold]"
         )
-        export_full_table(bq_client, bq_project, bq_dataset, bq_table, storage)
+        export_full_table(
+            bq_client, bq_project, bq_dataset, bq_table, storage, fields=fields
+        )
         last_watermark = get_current_max_watermark(
             bq_client, bq_project, bq_dataset, bq_table, watermark_column
         )
@@ -448,6 +458,7 @@ def cdc(
             watermark_column,
             last_watermark or "",
             export_prefix=prefix,
+            fields=fields,
         )
 
         last_watermark = current_max
@@ -479,7 +490,7 @@ def scheduled_cdc(
         ),
     ],
     ch_host: ChHost,
-    ch_port: ChPort ,
+    ch_port: ChPort,
     ch_user: ChUser = "default",
     ch_password: ChPassword = "",
     ch_database: ChDatabase = "default",
@@ -562,7 +573,9 @@ def scheduled_cdc(
 
     # 4. Do initial full export
     console.print("[bold]Running initial full export...[/bold]")
-    export_full_table(bq_client, bq_project, bq_dataset, bq_table, storage)
+    export_full_table(
+        bq_client, bq_project, bq_dataset, bq_table, storage, fields=fields
+    )
     console.print(
         "[green]Initial export complete. S3Queue will ingest the data.[/green]"
     )
@@ -577,6 +590,7 @@ def scheduled_cdc(
         watermark_column=watermark_column,
         schedule=schedule,
         service_account=service_account,
+        fields=fields,
     )
 
     console.print(f"\n[bold green]Setup complete![/bold green]")

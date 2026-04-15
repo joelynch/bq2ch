@@ -1,7 +1,8 @@
-from google.cloud import bigquery_datatransfer
+from google.cloud import bigquery, bigquery_datatransfer
 from google.protobuf.struct_pb2 import Struct
 from rich.console import Console
 
+from bq_ch_migrator.bq_export import build_select_list
 from bq_ch_migrator.config import StorageConfig, StorageType
 
 console = Console()
@@ -13,10 +14,12 @@ def build_export_query(
     table: str,
     storage: StorageConfig,
     watermark_column: str,
+    fields: list[bigquery.SchemaField] | None = None,
 ) -> str:
     """Build the EXPORT DATA query that uses @run_time for incremental exports."""
     dest_uri = storage.bq_export_uri(suffix="{run_time|'%Y%m%d_%H%M%S'}/*.parquet")
     source = f"`{project}.{dataset}.{table}`"
+    select = build_select_list(fields, source) if fields else f"SELECT * FROM {source}"
     where = f"WHERE `{watermark_column}` > TIMESTAMP_SUB(@run_time, INTERVAL 1 HOUR)"
 
     if storage.storage_type == StorageType.S3:
@@ -31,7 +34,7 @@ def build_export_query(
             f"    compression='SNAPPY',\n"
             f"    overwrite=true\n"
             f"  ) AS\n"
-            f"SELECT * FROM {source}\n{where}"
+            f"{select}\n{where}"
         )
     else:
         return (
@@ -42,7 +45,7 @@ def build_export_query(
             f"    compression='SNAPPY',\n"
             f"    overwrite=true\n"
             f"  ) AS\n"
-            f"SELECT * FROM {source}\n{where}"
+            f"{select}\n{where}"
         )
 
 
@@ -56,12 +59,13 @@ def create_scheduled_export(
     schedule: str = "every 15 minutes",
     display_name: str | None = None,
     service_account: str | None = None,
+    fields: list[bigquery.SchemaField] | None = None,
 ) -> str:
     """Create a BigQuery scheduled query that exports incremental data to GCS/S3.
 
     Returns the transfer config name (resource ID).
     """
-    query = build_export_query(project, dataset, table, storage, watermark_column)
+    query = build_export_query(project, dataset, table, storage, watermark_column, fields=fields)
 
     if display_name is None:
         display_name = f"bq-ch-migrator: {project}.{dataset}.{table}"

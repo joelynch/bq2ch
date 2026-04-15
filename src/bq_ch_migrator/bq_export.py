@@ -10,6 +10,28 @@ from bq_ch_migrator.config import StorageConfig, StorageType
 console = Console()
 
 
+def build_select_list(
+    fields: list[bigquery.SchemaField],
+    source: str,
+) -> str:
+    """Build a SELECT column list, casting JSON columns to STRING.
+
+    Returns 'SELECT *' if no JSON columns are present, otherwise returns
+    an explicit column list with CAST(col AS STRING) for JSON fields.
+    """
+    has_json = any(f.field_type == "JSON" for f in fields)
+    if not has_json:
+        return f"SELECT * FROM {source}"
+
+    cols = []
+    for f in fields:
+        if f.field_type == "JSON":
+            cols.append(f"CAST(`{f.name}` AS STRING) AS `{f.name}`")
+        else:
+            cols.append(f"`{f.name}`")
+    return f"SELECT {', '.join(cols)} FROM {source}"
+
+
 def _run_export_query(bq_client: bigquery.Client, sql: str) -> None:
     console.print(f"[bold]Running BQ EXPORT DATA...[/bold]")
     console.print(f"[dim]{sql}[/dim]")
@@ -24,9 +46,11 @@ def export_full_table(
     dataset: str,
     table: str,
     storage: StorageConfig,
+    fields: list[bigquery.SchemaField] | None = None,
 ) -> str:
     dest_uri = storage.bq_export_uri()
     source = f"`{project}.{dataset}.{table}`"
+    select = build_select_list(fields, source) if fields else f"SELECT * FROM {source}"
 
     if storage.storage_type == StorageType.S3:
         if not storage.bq_connection:
@@ -40,7 +64,7 @@ def export_full_table(
             f"    compression='SNAPPY',\n"
             f"    overwrite=true\n"
             f"  ) AS\n"
-            f"SELECT * FROM {source}"
+            f"{select}"
         )
     else:
         sql = (
@@ -51,7 +75,7 @@ def export_full_table(
             f"    compression='SNAPPY',\n"
             f"    overwrite=true\n"
             f"  ) AS\n"
-            f"SELECT * FROM {source}"
+            f"{select}"
         )
 
     _run_export_query(bq_client, sql)
@@ -67,9 +91,11 @@ def export_incremental(
     watermark_column: str,
     watermark_value: str,
     export_prefix: str,
+    fields: list[bigquery.SchemaField] | None = None,
 ) -> str:
     dest_uri = storage.bq_export_uri(suffix=f"{export_prefix}/*.parquet")
     source = f"`{project}.{dataset}.{table}`"
+    select = build_select_list(fields, source) if fields else f"SELECT * FROM {source}"
     where = f"WHERE `{watermark_column}` > '{watermark_value}'"
 
     if storage.storage_type == StorageType.S3:
@@ -84,7 +110,7 @@ def export_incremental(
             f"    compression='SNAPPY',\n"
             f"    overwrite=true\n"
             f"  ) AS\n"
-            f"SELECT * FROM {source}\n{where}"
+            f"{select}\n{where}"
         )
     else:
         sql = (
@@ -95,7 +121,7 @@ def export_incremental(
             f"    compression='SNAPPY',\n"
             f"    overwrite=true\n"
             f"  ) AS\n"
-            f"SELECT * FROM {source}\n{where}"
+            f"{select}\n{where}"
         )
 
     _run_export_query(bq_client, sql)
@@ -252,6 +278,7 @@ def export_latest_partition(
     table: str,
     storage: StorageConfig,
     start_time: datetime | None = None,
+    fields: list[bigquery.SchemaField] | None = None,
 ) -> str:
     """Export the latest partition of a partitioned BigQuery table.
 
@@ -270,6 +297,7 @@ def export_latest_partition(
 
     dest_uri = storage.bq_export_uri(suffix=f"partition_{partition_id}/*.parquet")
     source = f"`{project}.{dataset}.{table}`"
+    select = build_select_list(fields, source) if fields else f"SELECT * FROM {source}"
 
     if storage.storage_type == StorageType.S3:
         if not storage.bq_connection:
@@ -283,7 +311,7 @@ def export_latest_partition(
             f"    compression='SNAPPY',\n"
             f"    overwrite=true\n"
             f"  ) AS\n"
-            f"SELECT * FROM {source}\n{where}"
+            f"{select}\n{where}"
         )
     else:
         sql = (
@@ -294,7 +322,7 @@ def export_latest_partition(
             f"    compression='SNAPPY',\n"
             f"    overwrite=true\n"
             f"  ) AS\n"
-            f"SELECT * FROM {source}\n{where}"
+            f"{select}\n{where}"
         )
 
     _run_export_query(bq_client, sql)
